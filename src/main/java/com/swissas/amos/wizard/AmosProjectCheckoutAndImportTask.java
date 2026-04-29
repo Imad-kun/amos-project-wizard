@@ -91,6 +91,17 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             "    </state>\n" +
             "</component>\n";
 
+    /**
+     * VCS mapping — pre-written so {@code openOrImport()} picks it up immediately.
+     */
+    private static final String VCS_XML =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<project version=\"4\">\n" +
+            "  <component name=\"VcsDirectoryMappings\">\n" +
+            "    <mapping directory=\"\" vcs=\"Git\" />\n" +
+            "  </component>\n" +
+            "</project>\n";
+
     // ---- Fields ----
 
     private final String repoUrl;
@@ -173,6 +184,18 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         if (indicator.isCanceled()) return;
         indicator.setFraction(0.40);
 
+        // Step 2b — Pre-write .idea/modules.xml with ONLY the 5 AMOS modules.
+        // This prevents openOrImport() from auto-creating a root project module
+        // that would pollute both the module list and the Project view.
+        // Even if openOrImport() overwrites it, we re-apply in loadModules().
+        indicator.setText("Writing project configuration files…");
+        try {
+            writeIdeaConfigFiles();
+        } catch (IOException e) {
+            LOG.warn("Failed to pre-write .idea config files — continuing anyway", e);
+        }
+        if (indicator.isCanceled()) return;
+
         // Step 3 — Open the project.
         // IntelliJ will create .idea/ with a minimal workspace.xml.
         // We do NOT pre-write modules.xml because openOrImport() overwrites it.
@@ -235,6 +258,63 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     }
 
     // =========================================================================
+    // Step 2b — Pre-write .idea/ config files
+    // =========================================================================
+
+    /**
+     * Writes {@code .idea/modules.xml}, {@code .idea/vcs.xml}, and
+     * {@code .idea/.gitignore} BEFORE calling {@code openOrImport()}.
+     * <p>
+     * {@code modules.xml} lists <b>only</b> the 5 AMOS module {@code .iml} files —
+     * no root project module.  Pre-writing it gives IntelliJ a chance to honour the
+     * existing file so it never auto-creates a root module.  Even if
+     * {@code openOrImport()} overwrites it, {@link #loadModules} re-applies the
+     * correct state via the ModuleManager API and then rewrites the file again.
+     */
+    private void writeIdeaConfigFiles() throws IOException {
+        Path ideaDir = this.checkoutDir.resolve(".idea");
+        Files.createDirectories(ideaDir);
+
+        // modules.xml — only the 5 Eclipse-linked modules, no root module
+        Files.writeString(ideaDir.resolve("modules.xml"), buildModulesXml());
+        LOG.info("Pre-written .idea/modules.xml");
+
+        // vcs.xml
+        Files.writeString(ideaDir.resolve("vcs.xml"), VCS_XML);
+        LOG.info("Pre-written .idea/vcs.xml");
+
+        // .gitignore
+        Path gitignore = ideaDir.resolve(".gitignore");
+        if (!Files.exists(gitignore)) {
+            Files.writeString(gitignore, IDEA_GITIGNORE);
+        }
+    }
+
+    /**
+     * Builds a {@code modules.xml} document that references exactly the 5 AMOS module
+     * {@code .iml} files using {@code $PROJECT_DIR$} tokens.
+     * No root project module is included.
+     */
+    @NotNull
+    private String buildModulesXml() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        sb.append("<project version=\"4\">\n");
+        sb.append("  <component name=\"ProjectModuleManager\">\n");
+        sb.append("    <modules>\n");
+        for (String name : MODULE_NAMES) {
+            sb.append("      <module fileurl=\"file://$PROJECT_DIR$/").append(name)
+              .append("/").append(name).append(".iml\"");
+            sb.append(" filepath=\"$PROJECT_DIR$/").append(name)
+              .append("/").append(name).append(".iml\" />\n");
+        }
+        sb.append("    </modules>\n");
+        sb.append("  </component>\n");
+        sb.append("</project>\n");
+        return sb.toString();
+    }
+
+    // =========================================================================
     // Step 2 — Write .iml files
     // =========================================================================
 
@@ -276,13 +356,16 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     // =========================================================================
 
     /**
-     * Loads all module .iml files into the project using the ModuleManager API.
-     * This is more reliable than pre-writing modules.xml because:
-     * <ol>
-     *   <li>{@code openOrImport()} overwrites .idea/ contents on first open</li>
-     *   <li>ModuleManager.commit() writes modules.xml as a side effect</li>
-     *   <li>VFS is already initialized, so IntelliJ sees the .iml files</li>
-     * </ol>
+     * Loads all module .iml files into the project using the ModuleManager API,
+     * then removes any auto-created root project module that {@code openOrImport()}
+     * may have injected.
+     * <p>
+     * IntelliJ's {@code openOrImport()} sometimes creates a root-level module
+     * (named after the checkout directory) whose content root is the entire
+     * checkout directory.  This pollutes the module list and makes the Project
+     * view show the whole directory tree instead of only the module sources.
+     * We remove it here and rewrite {@code modules.xml} to ensure the file on
+     * disk also contains only the 5 AMOS modules — matching the reference project.
      */
     private void loadModules(@NotNull Project project) {
         ApplicationManager.getApplication().invokeAndWait(() -> {
@@ -295,9 +378,11 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
 
             WriteAction.run(() -> {
                 ModifiableModuleModel model = ModuleManager.getInstance(project).getModifiableModel();
-                List<String> loaded = new ArrayList<>();
-                List<String> failed = new ArrayList<>();
+                List<String> loaded  = new ArrayList<>();
+                List<String> failed  = new ArrayList<>();
+                List<String> removed = new ArrayList<>();
 
+                // ---- Step A: load the 5 AMOS modules ----
                 for (String moduleName : MODULE_NAMES) {
                     Path imlPath = this.checkoutDir.resolve(moduleName).resolve(moduleName + ".iml");
                     if (!Files.exists(imlPath)) {
@@ -305,8 +390,9 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                         failed.add(moduleName);
                         continue;
                     }
-
                     try {
+                        // loadModule is idempotent: if the module is already registered
+                        // (because openOrImport respected modules.xml), it just returns it.
                         String imlUrl = imlPath.toString().replace('\\', '/');
                         model.loadModule(imlUrl);
                         loaded.add(moduleName);
@@ -316,10 +402,48 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                     }
                 }
 
+                // ---- Step B: remove any module NOT in MODULE_NAMES ----
+                // This disposes the root project module that openOrImport() auto-creates.
+                Set<String> expected = new HashSet<>(MODULE_NAMES);
+                for (com.intellij.openapi.module.Module m : model.getModules()) {
+                    if (!expected.contains(m.getName())) {
+                        LOG.info("Removing unexpected module: " + m.getName());
+                        model.disposeModule(m);
+                        removed.add(m.getName());
+                    }
+                }
+
                 model.commit();
-                LOG.info("Loaded modules: " + loaded + (failed.isEmpty() ? "" : "; failed: " + failed));
+                LOG.info("Loaded modules: " + loaded
+                        + (failed.isEmpty()  ? "" : "; failed: "  + failed)
+                        + (removed.isEmpty() ? "" : "; removed: " + removed));
             });
         }, ModalityState.any());
+
+        // ---- Step C: delete any root-level .iml openOrImport() may have written ----
+        // (e.g. <checkoutDir>/amos-dev-7.5.iml)
+        try (java.util.stream.Stream<Path> rootFiles = Files.list(this.checkoutDir)) {
+            rootFiles.filter(p -> p.toString().endsWith(".iml") && !Files.isDirectory(p))
+                     .forEach(p -> {
+                         try {
+                             Files.delete(p);
+                             LOG.info("Deleted auto-created root .iml: " + p);
+                         } catch (IOException e) {
+                             LOG.warn("Could not delete root .iml: " + p, e);
+                         }
+                     });
+        } catch (IOException e) {
+            LOG.warn("Could not scan checkout dir for root .iml files", e);
+        }
+
+        // ---- Step D: rewrite modules.xml to enforce the correct module list ----
+        try {
+            Path modulesXml = this.checkoutDir.resolve(".idea").resolve("modules.xml");
+            Files.writeString(modulesXml, buildModulesXml());
+            LOG.info("Rewrote .idea/modules.xml with only AMOS modules");
+        } catch (IOException e) {
+            LOG.warn("Could not rewrite modules.xml after module cleanup", e);
+        }
     }
 
     // =========================================================================
@@ -373,6 +497,8 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         }, ModalityState.any());
 
         // --- VCS Mapping (Git) ---
+        // vcs.xml was already pre-written before openOrImport(); this API call ensures
+        // the in-memory VcsManager also reflects the mapping.
         ApplicationManager.getApplication().invokeAndWait(() -> {
             try {
                 ProjectLevelVcsManager vcsManager = ProjectLevelVcsManager.getInstance(project);
@@ -385,23 +511,17 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             }
         }, ModalityState.any());
 
-        // --- Write .idea/.gitignore and code style (file-based, after .idea/ exists) ---
+        // --- Write code style (file-based, after .idea/ exists) ---
         try {
             Path ideaDir = this.checkoutDir.resolve(".idea");
             Files.createDirectories(ideaDir);
-
-            Path gitignore = ideaDir.resolve(".gitignore");
-            if (!Files.exists(gitignore)) {
-                Files.writeString(gitignore, IDEA_GITIGNORE);
-                LOG.info("Written .idea/.gitignore");
-            }
 
             Path codeStylesDir = ideaDir.resolve("codeStyles");
             Files.createDirectories(codeStylesDir);
             Files.writeString(codeStylesDir.resolve("codeStyleConfig.xml"), CODE_STYLE_XML);
             LOG.info("Written codeStyleConfig.xml");
         } catch (IOException e) {
-            LOG.warn("Failed to write .idea config files", e);
+            LOG.warn("Failed to write .idea code style config", e);
         }
     }
 

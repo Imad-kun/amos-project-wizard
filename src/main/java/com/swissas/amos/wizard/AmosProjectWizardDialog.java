@@ -43,7 +43,7 @@ public class AmosProjectWizardDialog extends DialogWrapper {
     private ComboBox<String>       branchCombo;
     private JLabel                 branchStatusLabel;   // gray hints + red errors
     private TextFieldWithBrowseButton localRootField;
-    private JLabel                 projectNameLabel;
+    private JTextField             projectNameField;
     private JLabel                 checkoutDirLabel;
     private TextFieldWithBrowseButton sourceProjectField;
 
@@ -109,9 +109,17 @@ public class AmosProjectWizardDialog extends DialogWrapper {
                 "Select Local Root Directory", null, null,
                 FileChooserDescriptorFactory.createSingleFolderDescriptor());
 
-        // ---- Read-only derived labels ----
-        projectNameLabel = new JLabel(" ");
+        // ---- Derived fields ----
+        projectNameField = new JTextField();
+        projectNameField.setToolTipText("Auto-derived from the branch name. You can override it.");
         checkoutDirLabel = new JLabel(" ");
+
+        // Live-update checkout dir whenever the user edits the project name manually
+        projectNameField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e)  { updateCheckoutDir(); }
+            @Override public void removeUpdate(DocumentEvent e)  { updateCheckoutDir(); }
+            @Override public void changedUpdate(DocumentEvent e) { updateCheckoutDir(); }
+        });
 
         // ---- Source project ----
         sourceProjectField = new TextFieldWithBrowseButton();
@@ -121,15 +129,21 @@ public class AmosProjectWizardDialog extends DialogWrapper {
                 "Select Source AMOS Project", null, null,
                 FileChooserDescriptorFactory.createSingleFolderDescriptor());
 
-        // Live-update: branch text + local-root → derived labels
-        DocumentListener liveUpdate = new DocumentListener() {
+        // Live-update: branch text → project name + checkout dir
+        //              local-root text → checkout dir only (don't reset a manually-edited project name)
+        DocumentListener branchUpdate = new DocumentListener() {
             @Override public void insertUpdate(DocumentEvent e)  { updateDerivedFields(); }
             @Override public void removeUpdate(DocumentEvent e)  { updateDerivedFields(); }
             @Override public void changedUpdate(DocumentEvent e) { updateDerivedFields(); }
         };
+        DocumentListener rootUpdate = new DocumentListener() {
+            @Override public void insertUpdate(DocumentEvent e)  { updateCheckoutDir(); }
+            @Override public void removeUpdate(DocumentEvent e)  { updateCheckoutDir(); }
+            @Override public void changedUpdate(DocumentEvent e) { updateCheckoutDir(); }
+        };
         ((JTextField) branchCombo.getEditor().getEditorComponent())
-                .getDocument().addDocumentListener(liveUpdate);
-        localRootField.getTextField().getDocument().addDocumentListener(liveUpdate);
+                .getDocument().addDocumentListener(branchUpdate);
+        localRootField.getTextField().getDocument().addDocumentListener(rootUpdate);
         branchCombo.addItemListener(e -> updateDerivedFields());
 
         updateDerivedFields();
@@ -156,7 +170,7 @@ public class AmosProjectWizardDialog extends DialogWrapper {
         panel.add(branchStatusLabel, fc);
 
         addRow(panel, lc, fc, row++, "Local Root Directory:",    localRootField);
-        addRow(panel, lc, fc, row++, "Project Name:",            projectNameLabel);
+        addRow(panel, lc, fc, row++, "Project Name:",            projectNameField);
         addRow(panel, lc, fc, row++, "Checkout Directory:",      checkoutDirLabel);
         addRow(panel, lc, fc, row++, "Source Project for Config:", sourceProjectField);
 
@@ -308,17 +322,23 @@ public class AmosProjectWizardDialog extends DialogWrapper {
 
     private void updateDerivedFields() {
         String branch    = getCurrentBranch();
-        String localRoot = localRootField.getText().trim();
 
         if (branch.equals("Loading branches…") || !branch.startsWith("dev-")) {
-            projectNameLabel.setText(" ");
+            projectNameField.setText("");
             checkoutDirLabel.setText(" ");
             return;
         }
 
-        String projectName = branch.replace("dev-", "amos-");
-        projectNameLabel.setText(projectName);
-        checkoutDirLabel.setText(localRoot.isEmpty()
+        // e.g. dev-7.5  →  amos-dev-7.5
+        String projectName = "amos-" + branch;
+        projectNameField.setText(projectName);
+        updateCheckoutDir();
+    }
+
+    private void updateCheckoutDir() {
+        String localRoot   = localRootField.getText().trim();
+        String projectName = projectNameField.getText().trim();
+        checkoutDirLabel.setText((localRoot.isEmpty() || projectName.isEmpty())
                 ? " "
                 : localRoot + File.separator + projectName);
     }
@@ -332,6 +352,11 @@ public class AmosProjectWizardDialog extends DialogWrapper {
         String branch = getCurrentBranch();
         if (!BRANCH_PATTERN.matcher(branch).matches()) {
             return new ValidationInfo("Branch must match dev-X.Y (e.g. dev-7.5)", branchCombo);
+        }
+
+        String projectName = projectNameField.getText().trim();
+        if (projectName.isEmpty()) {
+            return new ValidationInfo("Project name is required", projectNameField);
         }
 
         String localRoot = localRootField.getText().trim();
@@ -372,8 +397,7 @@ public class AmosProjectWizardDialog extends DialogWrapper {
     public String getLocalRoot()         { return localRootField.getText().trim(); }
 
     public String getProjectName() {
-        String t = projectNameLabel.getText().trim();
-        return t.equals(" ") ? "" : t;
+        return projectNameField.getText().trim();
     }
 
     public String getCheckoutDir() {
