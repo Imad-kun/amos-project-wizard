@@ -1,0 +1,31 @@
+<idea-plugin>
+    <id>com.swissas.amos</id>
+    <name>AMOS Project Wizard</name>
+    <vendor>Swiss-AS</vendor>
+    <description>Clone and import an AMOS monorepo project from a Git branch into IntelliJ IDEA.</description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.idea.eclipse</depends>
+    <depends>Git4Idea</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <applicationService
+            serviceImplementation="com.swissas.amos.wizard.AmosPluginSettings"/>
+        <notificationGroup id="AMOS Wizard"
+                           displayType="BALLOON"
+                           isLogByDefault="true"/>
+    </extensions>
+
+    <actions>
+        <action id="Amos.NewProjectFromBranch"
+                class="com.swissas.amos.wizard.NewAmosProjectAction"
+                text="Project from Amos Branch..."
+                description="Clone and import an AMOS project from a Git branch"
+                icon="/icons/amos.svg">
+            <add-to-group group-id="NewProjectOrModuleGroup"
+                          anchor="after"
+                          relative-to-action="NewProject"/>
+        </action>
+    </actions>
+</idea-plugin>
+
