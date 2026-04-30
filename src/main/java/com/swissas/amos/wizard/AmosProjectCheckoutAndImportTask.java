@@ -46,17 +46,18 @@ import org.jetbrains.annotations.Nullable;
  * Background task that performs the full AMOS project setup:
  * <ol>
  *   <li>Git clone (3-phase: skip / resume / fresh)</li>
+ *   <li>Write minimal {@code .idea/} config skeleton (modules.xml, vcs.xml, misc.xml)</li>
  *   <li>Write Eclipse-linked .iml files for each module</li>
- *   <li>Open the project</li>
- *   <li>Programmatically load modules via ModuleManager API</li>
+ *   <li>Open the project in the IDE</li>
+ *   <li>Wait for post-startup initialization</li>
+ *   <li>Load/fix-up modules via ModuleManager API and rewrite modules.xml</li>
  *   <li>Configure project settings (JDK, VCS, code style)</li>
  *   <li>Copy run configurations and compiler settings from source project</li>
  * </ol>
  * <p>
- * The .iml files are written BEFORE opening the project (they live in module
- * directories, not in .idea/).  After opening, modules are loaded programmatically
- * via {@code ModuleManager.loadModule()} — this is more reliable than pre-writing
- * {@code modules.xml} which gets overwritten by {@code openOrImport()}.
+ * The {@code .idea/} skeleton and {@code .iml} files are written BEFORE opening
+ * the project so that {@code openOrImport()} picks up the correct module list and
+ * never auto-creates a root project module.
  */
 public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
 
@@ -102,6 +103,18 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             "  </component>\n" +
             "</project>\n";
 
+    /**
+     * ProjectRootManager entry — sets Java language level to JDK 21 so the IDE
+     * shows the correct language level immediately after the project is opened,
+     * even before the JDK is configured programmatically.
+     */
+    private static final String MISC_XML =
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+            "<project version=\"4\">\n" +
+            "  <component name=\"ProjectRootManager\" version=\"2\" languageLevel=\"JDK_21\"\n" +
+            "             default=\"false\" project-jdk-type=\"JavaSDK\" />\n" +
+            "</project>\n";
+
     // ---- Fields ----
 
     private final String repoUrl;
@@ -126,8 +139,26 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
      * Max concurrent LFS transfers.  Windows has a limited TCP socket pool;
      * the default (8) can exhaust it on repos with many LFS objects, causing
      * "bind: system lacked sufficient buffer space" errors.
+     * Set to 1 to open only a single TCP connection at a time.
      */
-    private static final int LFS_CONCURRENT_TRANSFERS = 2;
+    private static final int LFS_CONCURRENT_TRANSFERS = 1;
+    /**
+     * Number of LFS objects per batch API request.
+     * Each batch POST opens a new TCP connection; limiting to 1 object per request
+     * prevents simultaneous connections from exhausting the Windows socket buffer.
+     */
+    private static final int LFS_BATCH_SIZE = 1;
+    /**
+     * Maximum number of automatic LFS pull retries on socket-exhaustion errors.
+     * Windows releases sockets asynchronously; waiting between retries lets the OS
+     * reclaim them before the next attempt.
+     */
+    private static final int LFS_MAX_RETRIES = 5;
+    /**
+     * Wait time (ms) between LFS retry attempts.
+     * 15 seconds is usually enough for Windows to drain the TIME_WAIT socket pool.
+     */
+    private static final int LFS_RETRY_DELAY_MS = 15_000;
 
     // ---- Constructor ----
 
@@ -154,7 +185,12 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     public void run(@NotNull ProgressIndicator indicator) {
         indicator.setIndeterminate(false);
 
-        // Step 1 — Clone, Resume, or Skip
+        // ----------------------------------------------------------------
+        // Step 1 — Clone the repository (skip / resume / fresh clone).
+        //
+        // The project is NOT opened yet — we clone into a plain directory
+        // first, so git has an empty (or non-existent) target to work with.
+        // ----------------------------------------------------------------
         boolean alreadyCheckedOut = isAlreadyCheckedOut();
         if (alreadyCheckedOut) {
             LOG.info("Repository already checked out on correct branch — skipping clone step");
@@ -166,10 +202,35 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             if (!step1Clone(indicator)) return;
         }
         if (indicator.isCanceled()) return;
-        indicator.setFraction(0.30);
+        indicator.setFraction(0.55);
 
-        // Step 2 — Write Eclipse-linked .iml files BEFORE opening the project.
-        // These live in module directories (not in .idea/), so openOrImport won't touch them.
+        // ----------------------------------------------------------------
+        // Step 2 — Write the .idea/ skeleton BEFORE opening the project.
+        //
+        // modules.xml lists only the 5 AMOS modules (no root module).
+        // vcs.xml maps the project root to Git.
+        // misc.xml sets the language level to JDK 21.
+        // ----------------------------------------------------------------
+        indicator.setText("Writing project configuration…");
+        try {
+            writeIdeaConfigFiles();
+        } catch (IOException e) {
+            LOG.error("Failed to write .idea config files", e);
+            ApplicationManager.getApplication().invokeLater(() ->
+                    Messages.showErrorDialog(
+                            "Failed to write IntelliJ project files:\n" + e.getMessage(),
+                            "Configuration Error"), ModalityState.any());
+            return;
+        }
+        if (indicator.isCanceled()) return;
+        indicator.setFraction(0.58);
+
+        // ----------------------------------------------------------------
+        // Step 3 — Write Eclipse-linked .iml files.
+        //
+        // Requires .classpath/.project files that only exist after the clone.
+        // Written before opening so openOrImport() finds them on disk.
+        // ----------------------------------------------------------------
         indicator.setText("Writing module configuration files…");
         try {
             writeImlFiles();
@@ -182,29 +243,21 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             return;
         }
         if (indicator.isCanceled()) return;
-        indicator.setFraction(0.40);
+        indicator.setFraction(0.62);
 
-        // Step 2b — Pre-write .idea/modules.xml with ONLY the 5 AMOS modules.
-        // This prevents openOrImport() from auto-creating a root project module
-        // that would pollute both the module list and the Project view.
-        // Even if openOrImport() overwrites it, we re-apply in loadModules().
-        indicator.setText("Writing project configuration files…");
-        try {
-            writeIdeaConfigFiles();
-        } catch (IOException e) {
-            LOG.warn("Failed to pre-write .idea config files — continuing anyway", e);
-        }
-        if (indicator.isCanceled()) return;
-
-        // Step 3 — Open the project.
-        // IntelliJ will create .idea/ with a minimal workspace.xml.
-        // We do NOT pre-write modules.xml because openOrImport() overwrites it.
-        indicator.setText("Opening project…");
+        // ----------------------------------------------------------------
+        // Step 4 — Open the project.
+        //
+        // At this point the directory contains the full repository plus the
+        // .idea/ skeleton and .iml files, so IntelliJ opens it correctly.
+        // ----------------------------------------------------------------
+        indicator.setText("Opening project \"" + this.projectName + "\"…");
         final Project[] projectRef = {null};
         ApplicationManager.getApplication().invokeAndWait(() -> {
             try {
                 //noinspection deprecation
-                projectRef[0] = com.intellij.ide.impl.ProjectUtil.openOrImport(this.checkoutDir.toString(), null, false);
+                projectRef[0] = com.intellij.ide.impl.ProjectUtil.openOrImport(
+                        this.checkoutDir.toString(), null, false);
             } catch (Exception e) {
                 LOG.error("Failed to open project at " + this.checkoutDir, e);
             }
@@ -214,32 +267,41 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             LOG.error("ProjectUtil.openOrImport returned null for " + this.checkoutDir);
             ApplicationManager.getApplication().invokeLater(() ->
                     Messages.showErrorDialog(
-		                    "IntelliJ could not open the project at:\n" + this.checkoutDir +
-		                    "\n\nThe repository was cloned successfully — you can open it manually.",
+                            "IntelliJ could not open the project at:\n" + this.checkoutDir +
+                            "\n\nThe repository was cloned successfully — you can open it manually.",
                             "Project Open Failed"), ModalityState.any());
             return;
         }
-        indicator.setFraction(0.50);
+        indicator.setFraction(0.70);
 
-        // Step 4 — Wait for post-startup initialization
+        // ----------------------------------------------------------------
+        // Step 5 — Wait for post-startup initialization.
+        // ----------------------------------------------------------------
         indicator.setText("Waiting for project initialization…");
         waitForProjectReady(projectRef[0], indicator);
         if (indicator.isCanceled()) return;
-        indicator.setFraction(0.60);
+        indicator.setFraction(0.75);
 
-        // Step 5 — Programmatically load modules from the .iml files.
-        // This is the reliable way: ModuleManager.loadModule() adds each module
-        // and commit() writes modules.xml automatically.
+        // ----------------------------------------------------------------
+        // Step 6 — Rewrite modules.xml and load/fix-up modules.
+        //
+        // loadModules() removes any auto-created root module, loads the 5
+        // AMOS modules, and rewrites modules.xml to the correct state.
+        // ----------------------------------------------------------------
         indicator.setText("Loading modules…");
         loadModules(projectRef[0]);
-        indicator.setFraction(0.70);
+        indicator.setFraction(0.82);
 
-        // Step 6 — Configure project settings (JDK, VCS, code style, .gitignore)
+        // ----------------------------------------------------------------
+        // Step 7 — Configure project settings (JDK, VCS, code style).
+        // ----------------------------------------------------------------
         indicator.setText("Configuring project settings…");
         configureProjectSettings(projectRef[0]);
-        indicator.setFraction(0.80);
+        indicator.setFraction(0.88);
 
-        // Step 7 — Copy Run Configurations & Compiler Settings from source project
+        // ----------------------------------------------------------------
+        // Step 8 — Copy Run Configurations & Compiler Settings.
+        // ----------------------------------------------------------------
         if (this.sourceProjectPath != null) {
             indicator.setText("Copying run configurations…");
             step5CopyRunConfigs();
@@ -247,9 +309,11 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             step6CopyCompilerSettings();
         }
         if (indicator.isCanceled()) return;
-        indicator.setFraction(0.90);
+        indicator.setFraction(0.95);
 
-        // Step 8 — Verify modules were loaded correctly
+        // ----------------------------------------------------------------
+        // Step 9 — Verify that all expected modules were loaded.
+        // ----------------------------------------------------------------
         indicator.setText("Verifying module configuration…");
         verifyModules(projectRef[0]);
 
@@ -258,18 +322,38 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     }
 
     // =========================================================================
+    // Step 1 — Create empty project
+    // =========================================================================
+
+    /**
+     * Creates the checkout directory and writes a minimal {@code .idea/} skeleton
+     * so that IntelliJ recognises the directory as a valid project and opens it
+     * immediately — before the repository is cloned.
+     * <p>
+     * Files written:
+     * <ul>
+     *   <li>{@code .idea/modules.xml} — lists the 5 AMOS module {@code .iml} paths
+     *       (with {@code $PROJECT_DIR$} tokens).  Pre-writing this prevents
+     *       {@code openOrImport()} from auto-creating a root project module.</li>
+     *   <li>{@code .idea/vcs.xml} — registers the project root as a Git repository.</li>
+     *   <li>{@code .idea/misc.xml} — sets the Java language level to JDK 21.</li>
+     *   <li>{@code .idea/.gitignore} — standard IntelliJ defaults.</li>
+     * </ul>
+     */
+    private void createEmptyProject() throws IOException {
+        Files.createDirectories(this.checkoutDir);
+        writeIdeaConfigFiles();
+        LOG.info("Created empty project skeleton at: " + this.checkoutDir);
+    }
+
+    // =========================================================================
     // Step 2b — Pre-write .idea/ config files
     // =========================================================================
 
     /**
-     * Writes {@code .idea/modules.xml}, {@code .idea/vcs.xml}, and
-     * {@code .idea/.gitignore} BEFORE calling {@code openOrImport()}.
-     * <p>
-     * {@code modules.xml} lists <b>only</b> the 5 AMOS module {@code .iml} files —
-     * no root project module.  Pre-writing it gives IntelliJ a chance to honour the
-     * existing file so it never auto-creates a root module.  Even if
-     * {@code openOrImport()} overwrites it, {@link #loadModules} re-applies the
-     * correct state via the ModuleManager API and then rewrites the file again.
+     * Writes the minimal {@code .idea/} files needed for IntelliJ to open the
+     * project correctly.  Called from {@link #createEmptyProject()} before
+     * the repository is cloned, and also re-invokable at any time (idempotent).
      */
     private void writeIdeaConfigFiles() throws IOException {
         Path ideaDir = this.checkoutDir.resolve(".idea");
@@ -277,16 +361,44 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
 
         // modules.xml — only the 5 Eclipse-linked modules, no root module
         Files.writeString(ideaDir.resolve("modules.xml"), buildModulesXml());
-        LOG.info("Pre-written .idea/modules.xml");
+        LOG.info("Written .idea/modules.xml");
 
-        // vcs.xml
+        // vcs.xml — project root mapped to Git
         Files.writeString(ideaDir.resolve("vcs.xml"), VCS_XML);
-        LOG.info("Pre-written .idea/vcs.xml");
+        LOG.info("Written .idea/vcs.xml");
+
+        // misc.xml — sets JDK 21 language level immediately on project open
+        Files.writeString(ideaDir.resolve("misc.xml"), MISC_XML);
+        LOG.info("Written .idea/misc.xml");
 
         // .gitignore
         Path gitignore = ideaDir.resolve(".gitignore");
         if (!Files.exists(gitignore)) {
             Files.writeString(gitignore, IDEA_GITIGNORE);
+            LOG.info("Written .idea/.gitignore");
+        }
+    }
+
+    // =========================================================================
+    // Step 5 — Refresh VFS after clone
+    // =========================================================================
+
+    /**
+     * Performs a synchronous, recursive VFS refresh of the checkout directory.
+     * <p>
+     * When IntelliJ opened the (empty) project, its Virtual File System indexed
+     * only the {@code .idea/} skeleton.  After {@code git clone} fills the
+     * directory, the VFS must be told to rescan so that subsequent API calls
+     * (e.g. {@link LocalFileSystem#findFileByPath}) find the new files.
+     */
+    private void refreshProjectVfs() {
+        VirtualFile vDir = LocalFileSystem.getInstance()
+                .refreshAndFindFileByPath(this.checkoutDir.toString().replace('\\', '/'));
+        if (vDir != null) {
+            vDir.refresh(false /* synchronous */, true /* recursive */);
+            LOG.info("VFS refreshed for: " + this.checkoutDir);
+        } else {
+            LOG.warn("VFS could not find checkout dir after clone: " + this.checkoutDir);
         }
     }
 
@@ -680,22 +792,42 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         }
 
         // ------------------------------------------------------------------
-        // Decide: fresh clone or resume an existing partial clone?
-        // If the checkout dir already contains a .git directory, we resume
-        // by running  git fetch → git checkout <branch>.
+        // Decide which git strategy to use:
+        //
+        //  A) .git/ exists  → resume: git fetch + git checkout -B
+        //     (handles interrupted / partial clones from a previous run)
+        //
+        //  B) directory exists but no .git/  → init+fetch: git init, remote add,
+        //     git fetch, git checkout -B.
+        //     This is the normal case after createEmptyProject() pre-creates the
+        //     checkout dir with .idea/ — git clone refuses to run into a
+        //     non-empty directory, so we must seed the repo ourselves.
+        //
+        //  C) directory does not exist  → traditional git clone
+        //     (legacy / fallback path, kept for safety)
         // ------------------------------------------------------------------
-        boolean isResume = Files.isDirectory(this.checkoutDir.resolve(".git"));
+        boolean isResume   = Files.isDirectory(this.checkoutDir.resolve(".git"));
+        boolean dirExists  = Files.isDirectory(this.checkoutDir);
+        boolean useInitFetch = !isResume && dirExists;
 
         if (isResume) {
             LOG.info("Existing .git found — resuming (fetch + checkout) for branch " + this.branch
                      + " (user=" + user + ")");
+        } else if (useInitFetch) {
+            LOG.info("Project dir exists (pre-created) but no .git — using init+fetch strategy for branch "
+                     + this.branch + " (user=" + user + ")");
         } else {
-            LOG.info("Cloning with explicit credentials (user=" + user + ")");
+            LOG.info("Fresh clone (user=" + user + ")");
         }
 
-        ProcessOutput output = isResume
-                ? runResume(gitExe, user, pass, indicator)
-                : runClone(gitExe, user, pass, indicator);
+        ProcessOutput output;
+        if (isResume) {
+            output = runResume(gitExe, user, pass, indicator);
+        } else if (useInitFetch) {
+            output = runInitAndFetch(gitExe, user, pass, indicator);
+        } else {
+            output = runClone(gitExe, user, pass, indicator);
+        }
 
         if (output == null) return false;   // exception — already reported
         if (output.isCancelled() || indicator.isCanceled()) return false;
@@ -715,11 +847,12 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             String errorMsg = stderr.isEmpty() ? stdout : stderr;
             if (errorMsg.isEmpty()) errorMsg = "git exited with code " + output.getExitCode();
 
-            LOG.warn((isResume ? "Resume" : "Clone") + " failed (exit " + output.getExitCode() + "): " + errorMsg);
+            String opLabel = isResume ? "resume" : (useInitFetch ? "init+fetch" : "clone");
+            LOG.warn(opLabel + " failed (exit " + output.getExitCode() + "): " + errorMsg);
             final String errorMsgFinal = errorMsg;
             final String title = isResume ? "Resume Failed" : "Clone Failed";
             ApplicationManager.getApplication().invokeLater(() ->
-                    Messages.showErrorDialog("Git " + (isResume ? "resume" : "clone") + " failed:\n\n"
+                    Messages.showErrorDialog("Git " + opLabel + " failed:\n\n"
                             + errorMsgFinal, title),
                     ModalityState.any());
             return false;
@@ -729,32 +862,32 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             LOG.info("Clone completed but LFS smudge filter failed — will recover with git lfs pull");
         }
 
-        // --- LFS pull: download large binaries with throttled concurrency ---
+        // --- LFS pull: download large binaries with throttled concurrency + retry ---
         // Run this regardless of whether LFS failed during clone, because
         // GIT_LFS_SKIP_SMUDGE=1 means no LFS files were downloaded during clone.
+        // Windows "bind: lacked sufficient buffer space" errors are transient socket
+        // exhaustion — retrying after a short delay resolves them in practice.
         if (hasLfsFiles()) {
-            indicator.setText("Downloading LFS files…");
-            indicator.setText2("(throttled to " + LFS_CONCURRENT_TRANSFERS + " concurrent transfers)");
-            ProcessOutput lfsOutput = runLfsPull(gitExe, user, pass, indicator);
-            if (lfsOutput == null) return false;
-            if (lfsOutput.isCancelled() || indicator.isCanceled()) return false;
-
-            if (lfsOutput.getExitCode() != 0) {
-                // LFS pull failed — try a git checkout to restore working tree
-                LOG.warn("git lfs pull failed (exit " + lfsOutput.getExitCode() + ") — attempting git checkout");
-                indicator.setText("Restoring working tree…");
-                ProcessOutput restoreOutput = runGitRestore(gitExe, indicator);
-                if (restoreOutput != null && restoreOutput.getExitCode() != 0) {
-                    String lfsErr = lfsOutput.getStderr().trim();
-                    LOG.warn("git checkout restore also failed; LFS error: " + lfsErr);
-                    final String msg = lfsErr.isEmpty() ? "git lfs pull failed" : lfsErr;
-                    ApplicationManager.getApplication().invokeLater(() ->
-                            Messages.showWarningDialog(
-                                    "LFS download partially failed. Some binary files may be missing.\n\n"
-                                    + msg + "\n\nYou can retry later with: git lfs pull",
-                                    "LFS Download Warning"),
-                            ModalityState.any());
-                }
+            boolean lfsOk = retryLfsPull(gitExe, user, pass, indicator);
+            if (indicator.isCanceled()) return false;
+            if (!lfsOk) {
+                // All retries exhausted — attempt a git checkout to restore the working tree,
+                // then warn the user (non-fatal: the repo objects are intact).
+                LOG.warn("All LFS pull retries exhausted — attempting git checkout restore");
+                indicator.setText("Restoring working tree after LFS failure…");
+                runGitRestore(gitExe, indicator);
+                ApplicationManager.getApplication().invokeLater(() ->
+                        Messages.showWarningDialog(
+                                "LFS binary files could not be downloaded after " + LFS_MAX_RETRIES + " attempts.\n\n" +
+                                "Cause: Windows TCP socket buffer exhaustion\n" +
+                                "  (\"bind: lacked sufficient buffer space\")\n\n" +
+                                "The source code is intact — only large binary files are missing.\n" +
+                                "To download them later, run in the project directory:\n\n" +
+                                "  git lfs pull\n\n" +
+                                "If the error persists, wait a few minutes for Windows to reclaim\n" +
+                                "sockets in TIME_WAIT state, then retry.",
+                                "LFS Download Warning"),
+                        ModalityState.any());
             }
         }
 
@@ -846,6 +979,87 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                  + " → " + this.checkoutDir + " (credentials " + (user.isEmpty() ? "NONE" : "provided") + ")");
 
         return runGitProcess(cmd, indicator, CLONE_TIMEOUT_MS, "Clone");
+    }
+
+    // =========================================================================
+    // Init+Fetch: seed an existing directory as a new git repo
+    // =========================================================================
+
+    /**
+     * Initialises {@code checkoutDir} as a new Git repository and fetches the
+     * target branch.  Used when the directory was pre-created by
+     * {@link #createEmptyProject()} and already contains {@code .idea/}, which
+     * prevents {@code git clone} from running (git refuses to clone into a
+     * non-empty directory).
+     * <p>
+     * Equivalent steps:
+     * <ol>
+     *   <li>{@code git init}</li>
+     *   <li>{@code git remote add origin <url>}</li>
+     *   <li>{@code git fetch origin <branch> --depth=... --progress}</li>
+     *   <li>{@code git checkout -B <branch> origin/<branch>}</li>
+     * </ol>
+     *
+     * @return the process output of the last command that ran,
+     *         or {@code null} if a process could not be started
+     */
+    @Nullable
+    private ProcessOutput runInitAndFetch(@NotNull String gitExe,
+                                          @NotNull String user,
+                                          @NotNull String pass,
+                                          @NotNull ProgressIndicator indicator) {
+        String authHeader = AmosCredentialStore.basicAuthHeaderValue(user, pass);
+        String fetchUrl   = AmosCredentialStore.injectCredentials(this.repoUrl, user, pass);
+
+        // ---- Step 1: git init ----
+        indicator.setText2("Initialising git repository…");
+        {
+            GeneralCommandLine initCmd = buildGitCmd(gitExe, authHeader);
+            initCmd.setWorkDirectory(this.checkoutDir.toFile());
+            initCmd.addParameter("init");
+            ProcessOutput initOut = runGitProcess(initCmd, indicator, 30_000, "Init");
+            if (initOut == null) return null;
+            if (initOut.getExitCode() != 0 || initOut.isCancelled() || indicator.isCanceled()) {
+                return initOut;
+            }
+        }
+
+        // ---- Step 2: git remote add origin <url> ----
+        indicator.setText2("Adding remote origin…");
+        {
+            GeneralCommandLine remoteCmd = buildGitCmd(gitExe, authHeader);
+            remoteCmd.setWorkDirectory(this.checkoutDir.toFile());
+            remoteCmd.addParameters("remote", "add", "origin", fetchUrl);
+            ProcessOutput remoteOut = runGitProcess(remoteCmd, indicator, 30_000, "Remote add");
+            if (remoteOut == null) return null;
+            if (remoteOut.getExitCode() != 0 || remoteOut.isCancelled() || indicator.isCanceled()) {
+                return remoteOut;
+            }
+        }
+
+        // ---- Step 3: git fetch origin <branch> --progress ----
+        indicator.setText2("Fetching branch " + this.branch + " from remote…");
+        {
+            GeneralCommandLine fetchCmd = buildGitCmd(gitExe, authHeader);
+            fetchCmd.setWorkDirectory(this.checkoutDir.toFile());
+            fetchCmd.addParameters("fetch", "origin", this.branch, "--progress");
+            fetchCmd.setRedirectErrorStream(false);
+            ProcessOutput fetchOut = runGitProcess(fetchCmd, indicator, FETCH_TIMEOUT_MS, "Fetch");
+            if (fetchOut == null) return null;
+            if (fetchOut.getExitCode() != 0 || fetchOut.isCancelled() || indicator.isCanceled()) {
+                return fetchOut;
+            }
+        }
+
+        // ---- Step 4: git checkout -B <branch> origin/<branch> ----
+        indicator.setText2("Checking out branch " + this.branch + "…");
+        {
+            GeneralCommandLine checkoutCmd = buildGitCmd(gitExe, authHeader);
+            checkoutCmd.setWorkDirectory(this.checkoutDir.toFile());
+            checkoutCmd.addParameters("checkout", "-B", this.branch, "origin/" + this.branch);
+            checkoutCmd.setRedirectErrorStream(false);
+            return runGitProcess(checkoutCmd, indicator, CHECKOUT_TIMEOUT_MS, "Checkout");
+        }
     }
 
     // =========================================================================
@@ -1104,6 +1318,10 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         // Throttle LFS concurrent transfers to avoid socket exhaustion
         cmd.addParameter("-c");
         cmd.addParameter("lfs.concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS);
+        // Limit objects per batch API request — each POST opens a TCP connection;
+        // batchSize=1 ensures at most one connection is opened per batch round-trip.
+        cmd.addParameter("-c");
+        cmd.addParameter("lfs.batchsize=" + LFS_BATCH_SIZE);
         cmd.addParameters("lfs", "pull");
 
         cmd.withEnvironment("GIT_TERMINAL_PROMPT", "0");
@@ -1114,8 +1332,76 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         // Do NOT set GIT_LFS_SKIP_SMUDGE here — we want LFS to actually download
         cmd.setRedirectErrorStream(false);
 
-        LOG.info("Running: git lfs pull (concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS + ")");
+        LOG.info("Running: git lfs pull (concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS
+                + ", batchsize=" + LFS_BATCH_SIZE + ")");
         return runGitProcess(cmd, indicator, LFS_PULL_TIMEOUT_MS, "LFS Pull");
+    }
+
+    /**
+     * Retries {@link #runLfsPull} up to {@link #LFS_MAX_RETRIES} times.
+     * <p>
+     * The Windows error {@code "bind: An operation on a socket could not be performed
+     * because the system lacked sufficient buffer space"} is caused by temporary
+     * exhaustion of the TCP socket descriptor table.  Sockets in {@code TIME_WAIT}
+     * state hold a slot for up to 4 minutes; waiting {@link #LFS_RETRY_DELAY_MS}
+     * between retries allows the OS to reclaim them.
+     * <p>
+     * Only socket-exhaustion errors trigger a retry.  Authentication failures,
+     * network errors unrelated to socket binding, and unknown errors are surfaced
+     * immediately without waiting.
+     *
+     * @return {@code true} if any attempt succeeded, {@code false} if all failed
+     *         or the operation was cancelled
+     */
+    private boolean retryLfsPull(@NotNull String gitExe,
+                                  @NotNull String user,
+                                  @NotNull String pass,
+                                  @NotNull ProgressIndicator indicator) {
+        for (int attempt = 1; attempt <= LFS_MAX_RETRIES; attempt++) {
+            if (indicator.isCanceled()) return false;
+
+            indicator.setText("Downloading LFS files… (attempt " + attempt + "/" + LFS_MAX_RETRIES + ")");
+            indicator.setText2("concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS
+                    + ", batchsize=" + LFS_BATCH_SIZE);
+
+            ProcessOutput out = runLfsPull(gitExe, user, pass, indicator);
+            if (out == null)              return false;   // process failed to start
+            if (out.isCancelled())        return false;   // user cancelled
+            if (indicator.isCanceled())   return false;
+
+            if (out.getExitCode() == 0) {
+                LOG.info("LFS pull succeeded on attempt " + attempt);
+                return true;
+            }
+
+            String stderr = out.getStderr() != null ? out.getStderr().trim() : "";
+            boolean isSocketError = stderr.contains("lacked sufficient buffer space")
+                    || stderr.contains("bind:")
+                    || stderr.contains("dial tcp");
+
+            if (!isSocketError || attempt == LFS_MAX_RETRIES) {
+                LOG.warn("LFS pull failed (attempt " + attempt + "/" + LFS_MAX_RETRIES
+                        + ", exit " + out.getExitCode() + "): " + stderr);
+                return false;
+            }
+
+            // Transient Windows socket exhaustion — wait, then retry
+            int delaySec = LFS_RETRY_DELAY_MS / 1000;
+            LOG.info("LFS pull: socket exhaustion on attempt " + attempt
+                    + " — waiting " + delaySec + "s before retry " + (attempt + 1)
+                    + "/" + LFS_MAX_RETRIES);
+            indicator.setText("LFS: socket buffer full — waiting " + delaySec
+                    + "s before retry " + (attempt + 1) + "/" + LFS_MAX_RETRIES + "…");
+            indicator.setText2("Windows TIME_WAIT sockets are being released");
+
+            try {
+                Thread.sleep(LFS_RETRY_DELAY_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
     }
 
     /**
