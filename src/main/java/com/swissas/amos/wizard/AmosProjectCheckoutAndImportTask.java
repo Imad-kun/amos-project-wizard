@@ -220,10 +220,28 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         indicator.setFraction(0.62);
 
         // ----------------------------------------------------------------
-        // Step 4 — Open the project.
+        // Step 4 — Copy all settings from source project BEFORE opening.
+        //
+        // Copies all .idea/ files and subdirectories (run configurations,
+        // compiler settings, code styles, inspection profiles, dictionaries,
+        // ant configs, etc.) from the user-specified source project.
+        // Excluded: modules.xml, vcs.xml, misc.xml, workspace.xml, .gitignore
+        // (these are managed by the plugin itself).
+        // Done BEFORE openOrImport() so IntelliJ reads them on first open.
+        // ----------------------------------------------------------------
+        if (this.sourceProjectPath != null) {
+            indicator.setText("Copying settings from source project…");
+            step6CopyCompilerSettings();
+        }
+        if (indicator.isCanceled()) return;
+        indicator.setFraction(0.66);
+
+        // ----------------------------------------------------------------
+        // Step 5 — Open the project.
         //
         // At this point the directory contains the full repository plus the
-        // .idea/ skeleton and .iml files, so IntelliJ opens it correctly.
+        // .idea/ skeleton, .iml files, and copied settings, so IntelliJ
+        // opens it with all configuration already in place.
         // ----------------------------------------------------------------
         indicator.setText("Opening project \"" + this.projectName + "\"…");
         final Project[] projectRef = {null};
@@ -273,16 +291,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         configureProjectSettings(projectRef[0]);
         indicator.setFraction(0.88);
 
-        // ----------------------------------------------------------------
-        // Step 8 — Copy Run Configurations & Compiler Settings.
-        // ----------------------------------------------------------------
-        if (this.sourceProjectPath != null) {
-            indicator.setText("Copying run configurations…");
-            step5CopyRunConfigs();
-            indicator.setText("Copying compiler settings…");
-            step6CopyCompilerSettings();
-        }
-        if (indicator.isCanceled()) return;
         indicator.setFraction(0.95);
 
         // ----------------------------------------------------------------
@@ -1264,86 +1272,60 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     }
 
     // =========================================================================
-    // Step 5 — Copy Run Configurations
-    // =========================================================================
-
-    private void step5CopyRunConfigs() {
-        assert this.sourceProjectPath != null;
-
-        Path srcRunConfigs = this.sourceProjectPath.resolve(".idea").resolve("runConfigurations");
-        if (!Files.exists(srcRunConfigs) || !Files.isDirectory(srcRunConfigs)) {
-            LOG.info("No runConfigurations directory found in source project — skipping");
-            return;
-        }
-
-        Path destRunConfigs = this.checkoutDir.resolve(".idea").resolve("runConfigurations");
-        try {
-            Files.createDirectories(destRunConfigs);
-        } catch (IOException e) {
-            LOG.warn("Could not create runConfigurations directory: " + destRunConfigs, e);
-            return;
-        }
-
-        try (DirectoryStream<Path> stream =
-                     Files.newDirectoryStream(srcRunConfigs, "*.xml")) {
-            for (Path srcFile : stream) {
-                try {
-                    String content = Files.readString(srcFile);
-                    content = substituteProjectDir(content);
-                    content = substituteBranchVersion(content);
-                    Path destFile = destRunConfigs.resolve(srcFile.getFileName());
-                    Files.writeString(destFile, content);
-                    LOG.info("Copied run config: " + srcFile.getFileName());
-                } catch (IOException e) {
-                    LOG.warn("Failed to copy run config " + srcFile.getFileName(), e);
-                }
-            }
-        } catch (IOException e) {
-            LOG.warn("Failed to list run configurations in " + srcRunConfigs, e);
-        }
-    }
-
-    // =========================================================================
-    // Step 6 — Copy Compiler Settings
+    // Step 8 — Copy all settings from source project
     // =========================================================================
 
     private void step6CopyCompilerSettings() {
         assert this.sourceProjectPath != null;
 
-        String[] configFiles = {"compiler.xml", "java-compiler.xml", "encodings.xml", "saveactions_settings.xml"};
         Path srcIdeaDir = this.sourceProjectPath.resolve(".idea");
         Path destIdeaDir = this.checkoutDir.resolve(".idea");
 
-        for (String fileName : configFiles) {
-            Path srcFile = srcIdeaDir.resolve(fileName);
-            if (!Files.exists(srcFile)) {
-                // Silently skip — not an error
-                continue;
-            }
-            try {
-                String content = Files.readString(srcFile);
-                content = substituteProjectDir(content);
-                Files.writeString(destIdeaDir.resolve(fileName), content);
-                LOG.info("Copied config: " + fileName);
-            } catch (IOException e) {
-                LOG.warn("Failed to copy setting " + fileName, e);
-            }
-        }
+        // Files managed by the plugin itself — never overwrite from source
+        Set<String> EXCLUDED_FILES = new HashSet<>(Arrays.asList(
+                "modules.xml", "vcs.xml", "misc.xml", "workspace.xml", ".gitignore"));
 
-        // Copy inspection profiles directory
-        copyIdeaSubDirectory(srcIdeaDir, destIdeaDir, "inspectionProfiles");
+        // Copy all XML files (and other relevant settings files) from source .idea/
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(srcIdeaDir)) {
+            for (Path entry : stream) {
+                String name = entry.getFileName().toString();
+
+                if (EXCLUDED_FILES.contains(name)) continue;
+
+                if (Files.isDirectory(entry)) {
+                    // Copy subdirectories (runConfigurations, inspectionProfiles, codeStyles, dictionaries, etc.)
+                    copyIdeaSubDirectory(srcIdeaDir, destIdeaDir, name);
+                } else if (Files.isRegularFile(entry)) {
+                    // Copy individual settings files (compiler.xml, ant.xml, saveactions_settings.xml, etc.)
+                    try {
+                        String content = Files.readString(entry);
+                        content = substituteProjectDir(content);
+                        content = substituteBranchVersion(content);
+                        Files.writeString(destIdeaDir.resolve(name), content);
+                        LOG.info("Copied config: " + name);
+                    } catch (IOException e) {
+                        LOG.warn("Failed to copy setting " + name, e);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            LOG.warn("Failed to list source .idea/ directory: " + srcIdeaDir, e);
+        }
     }
 
     /**
-     * Copies all XML files from a subdirectory of the source project's {@code .idea/}
+     * Copies all files from a subdirectory of the source project's {@code .idea/}
      * into the corresponding subdirectory of the destination project's {@code .idea/}.
-     * Path substitution is applied to each file.
+     * Path and branch version substitution is applied to text files.
      */
     private void copyIdeaSubDirectory(@NotNull Path srcIdeaDir,
                                        @NotNull Path destIdeaDir,
                                        @NotNull String subDir) {
         Path srcDir = srcIdeaDir.resolve(subDir);
         if (!Files.isDirectory(srcDir)) return;
+
+        // Skip directories that should not be copied (e.g. shelf, workspace-related)
+        if ("shelf".equals(subDir)) return;
 
         Path destDir = destIdeaDir.resolve(subDir);
         try {
@@ -1353,11 +1335,13 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             return;
         }
 
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(srcDir, "*.xml")) {
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(srcDir)) {
             for (Path srcFile : stream) {
+                if (!Files.isRegularFile(srcFile)) continue;
                 try {
                     String content = Files.readString(srcFile);
                     content = substituteProjectDir(content);
+                    content = substituteBranchVersion(content);
                     Files.writeString(destDir.resolve(srcFile.getFileName()), content);
                     LOG.info("Copied " + subDir + "/" + srcFile.getFileName());
                 } catch (IOException e) {
