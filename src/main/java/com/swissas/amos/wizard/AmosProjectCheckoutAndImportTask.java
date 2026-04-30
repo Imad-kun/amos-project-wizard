@@ -133,32 +133,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     private static final int FETCH_TIMEOUT_MS   = 2 * 60 * 60 * 1000;
     /** 5 minutes for checkout (local operation). */
     private static final int CHECKOUT_TIMEOUT_MS = 5 * 60 * 1000;
-    /** 2 hours for LFS pull (many large binaries). */
-    private static final int LFS_PULL_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-    /**
-     * Max concurrent LFS transfers.  Windows has a limited TCP socket pool;
-     * the default (8) can exhaust it on repos with many LFS objects, causing
-     * "bind: system lacked sufficient buffer space" errors.
-     * Set to 1 to open only a single TCP connection at a time.
-     */
-    private static final int LFS_CONCURRENT_TRANSFERS = 1;
-    /**
-     * Number of LFS objects per batch API request.
-     * Each batch POST opens a new TCP connection; limiting to 1 object per request
-     * prevents simultaneous connections from exhausting the Windows socket buffer.
-     */
-    private static final int LFS_BATCH_SIZE = 1;
-    /**
-     * Maximum number of automatic LFS pull retries on socket-exhaustion errors.
-     * Windows releases sockets asynchronously; waiting between retries lets the OS
-     * reclaim them before the next attempt.
-     */
-    private static final int LFS_MAX_RETRIES = 5;
-    /**
-     * Wait time (ms) between LFS retry attempts.
-     * 15 seconds is usually enough for Windows to drain the TIME_WAIT socket pool.
-     */
-    private static final int LFS_RETRY_DELAY_MS = 15_000;
 
     // ---- Constructor ----
 
@@ -832,13 +806,7 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         if (output == null) return false;   // exception — already reported
         if (output.isCancelled() || indicator.isCanceled()) return false;
 
-        // A non-zero exit from clone is acceptable if the error is only about
-        // LFS smudge filter failure — the repo objects are there, just the
-        // large binaries need a separate `git lfs pull`.
-        boolean cloneOk = output.getExitCode() == 0;
-        boolean lfsSmudgeFailed = !cloneOk && isLfsSmudgeError(output);
-
-        if (!cloneOk && !lfsSmudgeFailed) {
+        if (output.getExitCode() != 0) {
             // Genuine failure — report the error.
             // Do NOT delete the checkout dir: it may contain a valid partial clone
             // that the user can retry later.
@@ -858,9 +826,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             return false;
         }
 
-        if (lfsSmudgeFailed) {
-            LOG.info("Clone completed but LFS smudge filter failed — will recover with git lfs pull");
-        }
 
         // --- Configure remote to track ALL branches (not just the cloned one) ---
         // git clone --single-branch and git init+fetch both set a narrow fetch refspec
@@ -871,35 +836,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         indicator.setText("Fetching remote branch list…");
         configureRemoteTracking(gitExe, user, pass, indicator);
         if (indicator.isCanceled()) return false;
-
-        // --- LFS pull: download large binaries with throttled concurrency + retry ---
-        // Run this regardless of whether LFS failed during clone, because
-        // GIT_LFS_SKIP_SMUDGE=1 means no LFS files were downloaded during clone.
-        // Windows "bind: lacked sufficient buffer space" errors are transient socket
-        // exhaustion — retrying after a short delay resolves them in practice.
-        if (hasLfsFiles()) {
-            boolean lfsOk = retryLfsPull(gitExe, user, pass, indicator);
-            if (indicator.isCanceled()) return false;
-            if (!lfsOk) {
-                // All retries exhausted — attempt a git checkout to restore the working tree,
-                // then warn the user (non-fatal: the repo objects are intact).
-                LOG.warn("All LFS pull retries exhausted — attempting git checkout restore");
-                indicator.setText("Restoring working tree after LFS failure…");
-                runGitRestore(gitExe, indicator);
-                ApplicationManager.getApplication().invokeLater(() ->
-                        Messages.showWarningDialog(
-                                "LFS binary files could not be downloaded after " + LFS_MAX_RETRIES + " attempts.\n\n" +
-                                "Cause: Windows TCP socket buffer exhaustion\n" +
-                                "  (\"bind: lacked sufficient buffer space\")\n\n" +
-                                "The source code is intact — only large binary files are missing.\n" +
-                                "To download them later, run in the project directory:\n\n" +
-                                "  git lfs pull\n\n" +
-                                "If the error persists, wait a few minutes for Windows to reclaim\n" +
-                                "sockets in TIME_WAIT state, then retry.",
-                                "LFS Download Warning"),
-                        ModalityState.any());
-            }
-        }
 
         return true;
     }
@@ -1197,10 +1133,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     /**
      * Creates a {@link GeneralCommandLine} pre-configured with credential suppression
      * environment variables and an optional {@code http.extraHeader}.
-     * <p>
-     * Also sets {@code GIT_LFS_SKIP_SMUDGE=1} so that LFS files are not downloaded
-     * during clone/fetch.  They are pulled separately afterwards with throttled
-     * concurrency to avoid exhausting Windows TCP socket buffers.
      */
     @NotNull
     private static GeneralCommandLine buildGitCmd(@NotNull String gitExe,
@@ -1217,7 +1149,8 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         cmd.withEnvironment("GIT_GCM_INTERACTIVE", "never");
         cmd.withEnvironment("GIT_ASKPASS",          "");
         cmd.withEnvironment("SSH_ASKPASS",          "");
-        // Skip LFS during clone/fetch — we pull LFS separately with throttled concurrency
+        // Skip LFS smudge filter — prevents git from spawning git-lfs during checkout
+        // which would block the process (keeps pipes open) or fail if LFS isn't configured.
         cmd.withEnvironment("GIT_LFS_SKIP_SMUDGE", "1");
         return cmd;
     }
@@ -1331,177 +1264,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     }
 
     // =========================================================================
-    // LFS helpers
-    // =========================================================================
-
-    /**
-     * Returns {@code true} if the process output looks like a Git LFS smudge-filter failure
-     * (clone succeeded but checkout failed because LFS couldn't download binaries).
-     * This is recoverable via a separate {@code git lfs pull}.
-     */
-    private static boolean isLfsSmudgeError(@NotNull ProcessOutput output) {
-        String stderr = output.getStderr();
-        return stderr != null
-                && (stderr.contains("smudge filter lfs failed")
-                    || stderr.contains("git-lfs filter-process")
-                    || (stderr.contains("Clone succeeded") && stderr.contains("checkout failed")));
-    }
-
-    /**
-     * Checks whether the checkout directory contains a {@code .gitattributes} file that
-     * references LFS, or whether a {@code .git/lfs} directory exists.
-     */
-    private boolean hasLfsFiles() {
-        if (Files.isDirectory(this.checkoutDir.resolve(".git").resolve("lfs"))) return true;
-        Path gitattributes = this.checkoutDir.resolve(".gitattributes");
-        if (Files.exists(gitattributes)) {
-            try {
-                String content = Files.readString(gitattributes);
-                return content.contains("filter=lfs");
-            } catch (IOException e) {
-                LOG.warn("Could not read .gitattributes", e);
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Runs {@code git lfs pull} with throttled concurrency to download LFS objects
-     * without exhausting the Windows TCP socket pool.
-     *
-     * @return the process output, or {@code null} if the process could not be started
-     */
-    @Nullable
-    private ProcessOutput runLfsPull(@NotNull String gitExe,
-                                     @NotNull String user,
-                                     @NotNull String pass,
-                                     @NotNull ProgressIndicator indicator) {
-        String authHeader = AmosCredentialStore.basicAuthHeaderValue(user, pass);
-
-        GeneralCommandLine cmd = new GeneralCommandLine(gitExe);
-        cmd.setWorkDirectory(this.checkoutDir.toFile());
-        // Credential suppression
-        cmd.addParameter("-c");
-        cmd.addParameter("credential.helper=");
-        if (authHeader != null) {
-            cmd.addParameter("-c");
-            cmd.addParameter("http.extraHeader=Authorization: " + authHeader);
-        }
-        // Throttle LFS concurrent transfers to avoid socket exhaustion
-        cmd.addParameter("-c");
-        cmd.addParameter("lfs.concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS);
-        // Limit objects per batch API request — each POST opens a TCP connection;
-        // batchSize=1 ensures at most one connection is opened per batch round-trip.
-        cmd.addParameter("-c");
-        cmd.addParameter("lfs.batchsize=" + LFS_BATCH_SIZE);
-        cmd.addParameters("lfs", "pull");
-
-        cmd.withEnvironment("GIT_TERMINAL_PROMPT", "0");
-        cmd.withEnvironment("GCM_INTERACTIVE",     "never");
-        cmd.withEnvironment("GIT_GCM_INTERACTIVE", "never");
-        cmd.withEnvironment("GIT_ASKPASS",          "");
-        cmd.withEnvironment("SSH_ASKPASS",          "");
-        // Do NOT set GIT_LFS_SKIP_SMUDGE here — we want LFS to actually download
-        cmd.setRedirectErrorStream(false);
-
-        LOG.info("Running: git lfs pull (concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS
-                + ", batchsize=" + LFS_BATCH_SIZE + ")");
-        return runGitProcess(cmd, indicator, LFS_PULL_TIMEOUT_MS, "LFS Pull");
-    }
-
-    /**
-     * Retries {@link #runLfsPull} up to {@link #LFS_MAX_RETRIES} times.
-     * <p>
-     * The Windows error {@code "bind: An operation on a socket could not be performed
-     * because the system lacked sufficient buffer space"} is caused by temporary
-     * exhaustion of the TCP socket descriptor table.  Sockets in {@code TIME_WAIT}
-     * state hold a slot for up to 4 minutes; waiting {@link #LFS_RETRY_DELAY_MS}
-     * between retries allows the OS to reclaim them.
-     * <p>
-     * Only socket-exhaustion errors trigger a retry.  Authentication failures,
-     * network errors unrelated to socket binding, and unknown errors are surfaced
-     * immediately without waiting.
-     *
-     * @return {@code true} if any attempt succeeded, {@code false} if all failed
-     *         or the operation was cancelled
-     */
-    private boolean retryLfsPull(@NotNull String gitExe,
-                                  @NotNull String user,
-                                  @NotNull String pass,
-                                  @NotNull ProgressIndicator indicator) {
-        for (int attempt = 1; attempt <= LFS_MAX_RETRIES; attempt++) {
-            if (indicator.isCanceled()) return false;
-
-            indicator.setText("Downloading LFS files… (attempt " + attempt + "/" + LFS_MAX_RETRIES + ")");
-            indicator.setText2("concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS
-                    + ", batchsize=" + LFS_BATCH_SIZE);
-
-            ProcessOutput out = runLfsPull(gitExe, user, pass, indicator);
-            if (out == null)              return false;   // process failed to start
-            if (out.isCancelled())        return false;   // user cancelled
-            if (indicator.isCanceled())   return false;
-
-            if (out.getExitCode() == 0) {
-                LOG.info("LFS pull succeeded on attempt " + attempt);
-                return true;
-            }
-
-            String stderr = out.getStderr() != null ? out.getStderr().trim() : "";
-            boolean isSocketError = stderr.contains("lacked sufficient buffer space")
-                    || stderr.contains("bind:")
-                    || stderr.contains("dial tcp");
-
-            if (!isSocketError || attempt == LFS_MAX_RETRIES) {
-                LOG.warn("LFS pull failed (attempt " + attempt + "/" + LFS_MAX_RETRIES
-                        + ", exit " + out.getExitCode() + "): " + stderr);
-                return false;
-            }
-
-            // Transient Windows socket exhaustion — wait, then retry
-            int delaySec = LFS_RETRY_DELAY_MS / 1000;
-            LOG.info("LFS pull: socket exhaustion on attempt " + attempt
-                    + " — waiting " + delaySec + "s before retry " + (attempt + 1)
-                    + "/" + LFS_MAX_RETRIES);
-            indicator.setText("LFS: socket buffer full — waiting " + delaySec
-                    + "s before retry " + (attempt + 1) + "/" + LFS_MAX_RETRIES + "…");
-            indicator.setText2("Windows TIME_WAIT sockets are being released");
-
-            try {
-                Thread.sleep(LFS_RETRY_DELAY_MS);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Runs {@code git checkout -- .} to restore the working tree after a partial LFS failure.
-     * This re-runs the smudge filter for files that failed, potentially succeeding now
-     * that socket pressure is lower.
-     */
-    @Nullable
-    private ProcessOutput runGitRestore(@NotNull String gitExe,
-                                         @NotNull ProgressIndicator indicator) {
-        try {
-            GeneralCommandLine cmd = new GeneralCommandLine(gitExe);
-            cmd.setWorkDirectory(this.checkoutDir.toFile());
-            cmd.addParameters("checkout", "--", ".");
-            cmd.withEnvironment("GIT_TERMINAL_PROMPT", "0");
-            // Throttle LFS here too
-            cmd.addParameter("-c");
-            cmd.addParameter("lfs.concurrenttransfers=" + LFS_CONCURRENT_TRANSFERS);
-            cmd.setRedirectErrorStream(false);
-
-            return runGitProcess(cmd, indicator, CHECKOUT_TIMEOUT_MS, "Restore");
-        } catch (Exception e) {
-            LOG.warn("git checkout restore failed", e);
-            return null;
-        }
-    }
-
-    // =========================================================================
     // Step 5 — Copy Run Configurations
     // =========================================================================
 
@@ -1528,6 +1290,7 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                 try {
                     String content = Files.readString(srcFile);
                     content = substituteProjectDir(content);
+                    content = substituteBranchVersion(content);
                     Path destFile = destRunConfigs.resolve(srcFile.getFileName());
                     Files.writeString(destFile, content);
                     LOG.info("Copied run config: " + srcFile.getFileName());
@@ -1547,7 +1310,7 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     private void step6CopyCompilerSettings() {
         assert this.sourceProjectPath != null;
 
-        String[] configFiles = {"compiler.xml", "java-compiler.xml", "encodings.xml"};
+        String[] configFiles = {"compiler.xml", "java-compiler.xml", "encodings.xml", "saveactions_settings.xml"};
         Path srcIdeaDir = this.sourceProjectPath.resolve(".idea");
         Path destIdeaDir = this.checkoutDir.resolve(".idea");
 
@@ -1561,10 +1324,48 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                 String content = Files.readString(srcFile);
                 content = substituteProjectDir(content);
                 Files.writeString(destIdeaDir.resolve(fileName), content);
-                LOG.info("Copied compiler config: " + fileName);
+                LOG.info("Copied config: " + fileName);
             } catch (IOException e) {
-                LOG.warn("Failed to copy compiler setting " + fileName, e);
+                LOG.warn("Failed to copy setting " + fileName, e);
             }
+        }
+
+        // Copy inspection profiles directory
+        copyIdeaSubDirectory(srcIdeaDir, destIdeaDir, "inspectionProfiles");
+    }
+
+    /**
+     * Copies all XML files from a subdirectory of the source project's {@code .idea/}
+     * into the corresponding subdirectory of the destination project's {@code .idea/}.
+     * Path substitution is applied to each file.
+     */
+    private void copyIdeaSubDirectory(@NotNull Path srcIdeaDir,
+                                       @NotNull Path destIdeaDir,
+                                       @NotNull String subDir) {
+        Path srcDir = srcIdeaDir.resolve(subDir);
+        if (!Files.isDirectory(srcDir)) return;
+
+        Path destDir = destIdeaDir.resolve(subDir);
+        try {
+            Files.createDirectories(destDir);
+        } catch (IOException e) {
+            LOG.warn("Could not create " + subDir + " directory: " + destDir, e);
+            return;
+        }
+
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(srcDir, "*.xml")) {
+            for (Path srcFile : stream) {
+                try {
+                    String content = Files.readString(srcFile);
+                    content = substituteProjectDir(content);
+                    Files.writeString(destDir.resolve(srcFile.getFileName()), content);
+                    LOG.info("Copied " + subDir + "/" + srcFile.getFileName());
+                } catch (IOException e) {
+                    LOG.warn("Failed to copy " + subDir + "/" + srcFile.getFileName(), e);
+                }
+            }
+        } catch (IOException e) {
+            LOG.warn("Failed to list files in " + srcDir, e);
         }
     }
 
@@ -1588,6 +1389,47 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             content = content.replaceAll(Pattern.quote(forwardSlashPath), "\\$PROJECT_DIR\\$");
         }
         return content;
+    }
+
+    /**
+     * Replaces the source project's branch version with the target branch version
+     * in the given content.  This handles version-specific references such as JRE
+     * paths (e.g. {@code jre21.0.7+6-jfx21.0.7-25.12-preview-windows} →
+     * {@code jre21.0.7+6-jfx21.0.7-26.6-preview-windows}).
+     * <p>
+     * The source version is extracted from the source project directory name
+     * (pattern: {@code amos-X.Y} or {@code amos-dev-X.Y}).
+     * The target version is extracted from the branch name ({@code dev-X.Y}).
+     */
+    private String substituteBranchVersion(@NotNull String content) {
+        String targetVersion = extractVersion(this.branch);
+        if (targetVersion == null) return content;
+
+        String sourceVersion = extractVersionFromProjectPath();
+        if (sourceVersion == null || sourceVersion.equals(targetVersion)) return content;
+
+        LOG.info("Substituting version " + sourceVersion + " → " + targetVersion + " in copied config");
+        return content.replace(sourceVersion, targetVersion);
+    }
+
+    /**
+     * Extracts the version number from a branch name like {@code dev-26.6} → {@code "26.6"}.
+     */
+    @Nullable
+    private static String extractVersion(@NotNull String branchName) {
+        java.util.regex.Matcher m = Pattern.compile("(\\d+\\.\\d+)").matcher(branchName);
+        return m.find() ? m.group(1) : null;
+    }
+
+    /**
+     * Extracts the version number from the source project directory name.
+     * Handles patterns like {@code amos-25.12} or {@code amos-dev-25.12}.
+     */
+    @Nullable
+    private String extractVersionFromProjectPath() {
+        if (this.sourceProjectPath == null) return null;
+        String dirName = this.sourceProjectPath.getFileName().toString();
+        return extractVersion(dirName);
     }
 
     /**
