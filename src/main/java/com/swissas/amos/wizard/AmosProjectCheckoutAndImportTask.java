@@ -862,6 +862,16 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             LOG.info("Clone completed but LFS smudge filter failed — will recover with git lfs pull");
         }
 
+        // --- Configure remote to track ALL branches (not just the cloned one) ---
+        // git clone --single-branch and git init+fetch both set a narrow fetch refspec
+        // (e.g. +refs/heads/dev-7.5:refs/remotes/origin/dev-7.5) which makes IntelliJ's
+        // Git view show only one remote branch.  We expand it to the wildcard refspec
+        // (+refs/heads/*:refs/remotes/origin/*) so all remote branches are visible,
+        // matching the behaviour of a regular clone without --single-branch.
+        indicator.setText("Fetching remote branch list…");
+        configureRemoteTracking(gitExe, user, pass, indicator);
+        if (indicator.isCanceled()) return false;
+
         // --- LFS pull: download large binaries with throttled concurrency + retry ---
         // Run this regardless of whether LFS failed during clone, because
         // GIT_LFS_SKIP_SMUDGE=1 means no LFS files were downloaded during clone.
@@ -930,6 +940,68 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                   });
         } catch (IOException ignored) {
             LOG.warn("Could not fully delete partial clone dir: " + dir);
+        }
+    }
+
+    // =========================================================================
+    // Remote tracking — expand to all branches after single-branch clone
+    // =========================================================================
+
+    /**
+     * Expands the remote's fetch refspec from the narrow single-branch form
+     * ({@code +refs/heads/dev-X.Y:refs/remotes/origin/dev-X.Y}) to the wildcard
+     * form ({@code +refs/heads/*:refs/remotes/origin/*}), then fetches all remote
+     * branch refs so that IntelliJ's Git view shows the full list of remote branches.
+     * <p>
+     * Two commands are run:
+     * <ol>
+     *   <li>{@code git remote set-branches origin '*'} — rewrites the fetch refspec
+     *       in {@code .git/config} to the wildcard.</li>
+     *   <li>{@code git fetch --no-tags origin} — downloads all remote-tracking refs.
+     *       Because most objects are already present (shared history from the
+     *       single-branch clone), only the diverging commits need to be transferred,
+     *       making this step relatively fast.</li>
+     * </ol>
+     * Non-fatal: failures are logged but do not abort the setup.
+     */
+    private void configureRemoteTracking(@NotNull String gitExe,
+                                          @NotNull String user,
+                                          @NotNull String pass,
+                                          @NotNull ProgressIndicator indicator) {
+        String authHeader = AmosCredentialStore.basicAuthHeaderValue(user, pass);
+
+        // Step 1: git remote set-branches origin '*'
+        try {
+            GeneralCommandLine setCmd = new GeneralCommandLine(gitExe);
+            setCmd.setWorkDirectory(this.checkoutDir.toFile());
+            setCmd.addParameters("remote", "set-branches", "origin", "*");
+            setCmd.withEnvironment("GIT_TERMINAL_PROMPT", "0");
+            new CapturingProcessHandler(setCmd).runProcess(30_000);
+            LOG.info("Remote fetch refspec expanded to wildcard (+refs/heads/*:refs/remotes/origin/*)");
+        } catch (Exception e) {
+            LOG.warn("Could not expand remote fetch refspec — remote branches may not all be visible", e);
+            return;
+        }
+
+        if (indicator.isCanceled()) return;
+
+        // Step 2: git fetch --no-tags origin  (populate all remote-tracking refs)
+        // Use a 30-minute timeout; the fetch is lightweight because objects are shared
+        // with the already-downloaded single-branch history.
+        indicator.setText2("Fetching all remote branch refs…");
+        GeneralCommandLine fetchCmd = buildGitCmd(gitExe, authHeader);
+        fetchCmd.setWorkDirectory(this.checkoutDir.toFile());
+        fetchCmd.addParameters("fetch", "--no-tags", "origin");
+        fetchCmd.setRedirectErrorStream(false);
+
+        ProcessOutput fetchOut = runGitProcess(fetchCmd, indicator, 30 * 60 * 1000, "Fetch all refs");
+        if (fetchOut == null) {
+            LOG.warn("Fetch all refs failed to start — remote branches may not all be visible");
+        } else if (fetchOut.getExitCode() != 0 && !fetchOut.isCancelled()) {
+            LOG.warn("Fetch all refs failed (exit " + fetchOut.getExitCode()
+                    + ") — remote branches may not all be visible: " + fetchOut.getStderr().trim());
+        } else {
+            LOG.info("All remote branch refs fetched — Git view will show full remote branch list");
         }
     }
 
