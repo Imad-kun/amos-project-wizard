@@ -1,0 +1,21 @@
+# Build output
+build/
+out/
+
+# Gradle
+.gradle/
+gradle/wrapper/gradle-wrapper.jar
+
+# IntelliJ Platform Gradle Plugin cache
+.intellijPlatform/
+
+# Build log files
+build-output*.txt
+build-plugin-output.txt
+
+# IntelliJ IDEA project files (workspace-specific)
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/shelf/
+*.iml
+
