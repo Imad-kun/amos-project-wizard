@@ -4,6 +4,8 @@
     <vendor>Swiss-AS</vendor>
     <description>Clone and import an AMOS monorepo project from a Git branch into IntelliJ IDEA.</description>
 
+    <idea-version since-build="251" />
+
     <depends>com.intellij.modules.platform</depends>
     <depends>org.jetbrains.idea.eclipse</depends>
     <depends>Git4Idea</depends>

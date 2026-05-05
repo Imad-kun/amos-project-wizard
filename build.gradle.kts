@@ -35,5 +35,12 @@ tasks.withType<JavaCompile> {
     options.compilerArgs.addAll(listOf("-Xlint:-deprecation", "-Xlint:-removal"))
 }
 
+tasks {
+    patchPluginXml {
+        sinceBuild.set("251")      // IntelliJ 2025.1
+        untilBuild.set("")         // no upper bound — compatible with future versions
+    }
+}
+
 
 
