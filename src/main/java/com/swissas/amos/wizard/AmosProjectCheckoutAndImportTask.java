@@ -134,6 +134,7 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     /** 5 minutes for checkout (local operation). */
     private static final int CHECKOUT_TIMEOUT_MS = 5 * 60 * 1000;
 
+
     // ---- Constructor ----
 
     public AmosProjectCheckoutAndImportTask(@NotNull String repoUrl,
@@ -174,6 +175,21 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
             indicator.setText(resuming ? "Resuming repository checkout…" : "Cloning repository…");
             indicator.setFraction(0.05);
             if (!step1Clone(indicator)) return;
+        }
+        if (indicator.isCanceled()) return;
+        indicator.setFraction(0.45);
+
+        // ----------------------------------------------------------------
+        // Step 1b — Run "git lfs pull" right after cloning, before opening.
+        //
+        // Executed as a plain OS process (like typing in a terminal) so it
+        // uses the system's git credential helper and LFS configuration
+        // without any extra environment manipulation.
+        // Non-fatal: a failure is logged but setup continues.
+        // ----------------------------------------------------------------
+        if (!alreadyCheckedOut) {
+            indicator.setText("Downloading LFS binary files…");
+            runLfsPull(indicator);
         }
         if (indicator.isCanceled()) return;
         indicator.setFraction(0.55);
@@ -849,6 +865,67 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     }
 
     /**
+     * Runs {@code git lfs pull} in the checkout directory as a plain OS process,
+     * exactly as if typed in a terminal.  The system's own credential helper and
+     * LFS configuration are used — no extra environment variables are injected.
+     * <p>
+     * Progress lines are forwarded to the {@code indicator}.  The call blocks until
+     * the command finishes or times out (2 hours).  Failures are logged as warnings
+     * but do not abort the setup.
+     */
+    private void runLfsPull(@NotNull ProgressIndicator indicator) {
+        String gitExe = resolveGitExecutable();
+        LOG.info("Running: " + gitExe + " lfs pull  in " + this.checkoutDir);
+        indicator.setText2("git lfs pull…");
+
+        try {
+            ProcessBuilder pb = new ProcessBuilder(gitExe, "lfs", "pull");
+            pb.directory(this.checkoutDir.toFile());
+            pb.redirectErrorStream(true);   // merge stderr into stdout — single stream to read
+
+            Process process = pb.start();
+
+            // Read and forward output lines to the progress indicator
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (indicator.isCanceled()) {
+                        process.destroyForcibly();
+                        LOG.info("git lfs pull cancelled by user");
+                        return;
+                    }
+                    String trimmed = line.trim();
+                    if (!trimmed.isEmpty()) {
+                        indicator.setText2(trimmed);
+                        LOG.info("lfs pull: " + trimmed);
+                    }
+                }
+            }
+
+            boolean finished = process.waitFor(2, java.util.concurrent.TimeUnit.HOURS);
+            if (!finished) {
+                process.destroyForcibly();
+                LOG.warn("git lfs pull timed out after 2 hours — binary files may be incomplete");
+                return;
+            }
+
+            int exitCode = process.exitValue();
+            if (exitCode == 0) {
+                LOG.info("git lfs pull completed successfully (exit 0)");
+            } else {
+                LOG.warn("git lfs pull exited with code " + exitCode
+                        + " — some binary files may still be pointer stubs."
+                        + " Run 'git lfs pull' manually in: " + this.checkoutDir);
+            }
+
+        } catch (Exception e) {
+            LOG.warn("git lfs pull failed: " + e.getMessage()
+                    + " — run 'git lfs pull' manually in: " + this.checkoutDir, e);
+        }
+    }
+
+    /**
      * Shows the credentials dialog on the EDT and waits for the result.
      * Uses {@link ModalityState#any()} so the dialog appears even while the
      * progress indicator (modal) is on screen.
@@ -901,10 +978,7 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
      * <ol>
      *   <li>{@code git remote set-branches origin '*'} — rewrites the fetch refspec
      *       in {@code .git/config} to the wildcard.</li>
-     *   <li>{@code git fetch --no-tags origin} — downloads all remote-tracking refs.
-     *       Because most objects are already present (shared history from the
-     *       single-branch clone), only the diverging commits need to be transferred,
-     *       making this step relatively fast.</li>
+     *   <li>{@code git fetch --no-tags origin} — downloads all remote-tracking refs.</li>
      * </ol>
      * Non-fatal: failures are logged but do not abort the setup.
      */
@@ -930,8 +1004,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         if (indicator.isCanceled()) return;
 
         // Step 2: git fetch --no-tags origin  (populate all remote-tracking refs)
-        // Use a 30-minute timeout; the fetch is lightweight because objects are shared
-        // with the already-downloaded single-branch history.
         indicator.setText2("Fetching all remote branch refs…");
         GeneralCommandLine fetchCmd = buildGitCmd(gitExe, authHeader);
         fetchCmd.setWorkDirectory(this.checkoutDir.toFile());
@@ -951,22 +1023,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
 
     /**
      * Builds and executes {@code git clone} with the given credentials.
-     * <p>
-     * Credentials are injected by embedding them directly in the clone URL
-     * ({@code https://user:pass@host/repo.git}) via
-     * {@link AmosCredentialStore#injectCredentials}.  This is the most reliable
-     * method — it works with every git version, every TLS backend (SChannel,
-     * OpenSSL), and survives HTTP redirects (unlike {@code http.extraHeader}).
-     * <p>
-     * All credential helpers and interactive prompts are aggressively disabled
-     * via environment variables so git can <b>never</b> block waiting for input:
-     * <ul>
-     *   <li>{@code GIT_TERMINAL_PROMPT=0} — disables built-in terminal prompt</li>
-     *   <li>{@code GCM_INTERACTIVE=never} — disables Git Credential Manager GUI dialog</li>
-     *   <li>{@code GIT_ASKPASS=} (empty) — prevents askpass helper scripts</li>
-     *   <li>{@code SSH_ASKPASS=} (empty) — prevents SSH askpass dialogs</li>
-     *   <li>{@code -c credential.helper=} — clears the credential helper chain</li>
-     * </ul>
      *
      * @return the process output, or {@code null} if the process could not be started
      */
@@ -976,7 +1032,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                                     @NotNull String pass,
                                     @NotNull ProgressIndicator indicator) {
 
-        // Build the authenticated URL (credentials embedded in the URL itself).
         String cloneUrl = AmosCredentialStore.injectCredentials(this.repoUrl, user, pass);
         String authHeader = AmosCredentialStore.basicAuthHeaderValue(user, pass);
 
@@ -984,9 +1039,9 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
 
         cmd.addParameters("clone",
                           "--branch", this.branch,
-                          "--single-branch",  // only fetch the selected branch — much faster for monorepos
+                          "--single-branch",
                           "--origin", "origin",
-                          "--progress",       // force progress output even when stderr is not a TTY
+                          "--progress",
                           cloneUrl, this.checkoutDir.toString());
 
         cmd.setRedirectErrorStream(false);
@@ -1007,14 +1062,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
      * {@link #createEmptyProject()} and already contains {@code .idea/}, which
      * prevents {@code git clone} from running (git refuses to clone into a
      * non-empty directory).
-     * <p>
-     * Equivalent steps:
-     * <ol>
-     *   <li>{@code git init}</li>
-     *   <li>{@code git remote add origin <url>}</li>
-     *   <li>{@code git fetch origin <branch> --depth=... --progress}</li>
-     *   <li>{@code git checkout -B <branch> origin/<branch>}</li>
-     * </ol>
      *
      * @return the process output of the last command that ran,
      *         or {@code null} if a process could not be started
@@ -1085,8 +1132,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
     /**
      * Resumes an interrupted clone by running {@code git fetch} followed by
      * {@code git checkout <branch>} inside the existing checkout directory.
-     * <p>
-     * The same credential / prompt-suppression strategy as {@link #runClone} is used.
      *
      * @return the process output of the <b>last</b> command that ran,
      *         or {@code null} if the process could not be started
@@ -1130,7 +1175,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
         {
             GeneralCommandLine checkoutCmd = buildGitCmd(gitExe, authHeader);
             checkoutCmd.setWorkDirectory(this.checkoutDir.toFile());
-            // Use -B so it works whether or not the local branch already exists
             checkoutCmd.addParameters("checkout", "-B", this.branch, "origin/" + this.branch);
             checkoutCmd.setRedirectErrorStream(false);
 
@@ -1165,13 +1209,8 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
 
     /**
      * Runs a git command using {@link OSProcessHandler} which <b>streams</b> output
-     * instead of buffering it all in RAM (as {@link CapturingProcessHandler} does).
-     * <p>
-     * For large operations like {@code git clone}, the progress output (object counting,
-     * receiving objects, resolving deltas) can produce hundreds of megabytes of text.
-     * Using a capturing handler would cause extreme memory pressure or OOM.
-     * <p>
-     * Only the <b>last few lines</b> of stderr are retained for error reporting purposes.
+     * instead of buffering it all in RAM.  Only the <b>last few lines</b> of stderr
+     * are retained for error reporting purposes.
      *
      * @param cmd       the git command to run
      * @param indicator progress indicator — updated with each line of output; cancellation is respected
@@ -1200,12 +1239,10 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                     if (text == null || text.isEmpty()) return;
                     String trimmed = text.trim();
 
-                    // Update progress indicator with latest line
                     if (!trimmed.isEmpty()) {
                         indicator.setText2(trimmed);
                     }
 
-                    // Keep last lines of stderr for error reporting
                     if (outputType == ProcessOutputTypes.STDERR) {
                         synchronized (stderrTail) {
                             stderrTail.add(text);
@@ -1215,7 +1252,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                         }
                     } else if (outputType == ProcessOutputTypes.STDOUT) {
                         synchronized (lastStdout) {
-                            // Only keep last 4KB of stdout
                             if (lastStdout.length() > 4096) {
                                 lastStdout.delete(0, lastStdout.length() - 2048);
                             }
@@ -1246,7 +1282,6 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                 }
             }
 
-            // Build a ProcessOutput from what we collected
             int exitCode = handler.getExitCode() != null ? handler.getExitCode() : -1;
             String stderr;
             synchronized (stderrTail) {
@@ -1257,8 +1292,7 @@ public class AmosProjectCheckoutAndImportTask extends Task.Backgroundable {
                 stdout = lastStdout.toString();
             }
 
-            ProcessOutput result = new ProcessOutput(stdout, stderr, exitCode, false, false);
-            return result;
+            return new ProcessOutput(stdout, stderr, exitCode, false, false);
 
         } catch (Exception e) {
             LOG.error("Exception starting git " + label.toLowerCase(), e);
